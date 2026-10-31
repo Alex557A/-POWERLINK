@@ -1,0 +1,40 @@
+# ============================================================
+# powerlink.proposed.hal — ПРИМЕР КОНФИГУРАЦИИ ПОСЛЕ НИОКР
+# проект Powerlink (Vanad), редакция 2
+# ------------------------------------------------------------
+# ЭТО ШАБЛОН-ПРИМЕР. ПОДСТАВЬТЕ СВОИ значения осей и узлов.
+# ============================================================
+
+loadrt powerlink personality=0x3f
+addf powerlink.0.update servo-thread
+
+setp powerlink.0.cycle-ns 2000000
+setp powerlink.0.mn-nodeid 240
+
+# --- Соответствие осей узлам ---
+# По умолчанию axis0..axis4 соответствуют узлам 3/4/5/6/11.
+# Раскомментируйте и измените под свою топологию:
+# setp powerlink.0.axis0-node-id 1
+# setp powerlink.0.axis1-node-id 2
+# setp powerlink.0.axis2-node-id 3
+# setp powerlink.0.axis3-node-id 4
+# setp powerlink.0.axis4-node-id 5
+
+# --- PID-контуры (Пример, нужна настройка) ---
+# loadrt pid num_chan=5
+# addf pid.0.do-pids servo-thread
+
+# --- Привязка осей (пример) ---
+# Ось 1 — привод POWERLINK, узел <node-id> (axis0)
+# net <joint-name>.pos-cmd   <- из траектории
+# net <joint-name>.pos-fb    powerlink.0.axis0-actual-pos -> <joint-name>.pos-fb
+# net <joint-name>.setpoint  powerlink.0.axis0-setpoint-pos <- <joint>.motor-pos-cmd
+# net <joint-name>.enable    powerlink.0.axis0-cmd-word <- (0x0006) следящий режим
+
+# --- SCALE (уточнить после снятия C_мотор) ---
+# setp powerlink.0.axis0-setpoint-pos-scale ...
+# C_мотор = <значение> ; SCALE = <значение>
+
+# --- Аварийные сигналы ---
+# net axis0-fault-all  powerlink.0.axis0-fault => ...
+# net axis1-fault-all  powerlink.0.axis1-fault => ...

@@ -1,0 +1,26 @@
+# ============================================================
+# test_mn_axes.hal — Пример задания пяти осей (personality=0x3f)
+# проект Powerlink (НИОКР Vanad)
+# ------------------------------------------------------------
+# ВАЖНО: значения axisN-node-id назначаются в конфигурации (setp).
+# Строки ниже — для справки, измените под свою топологию.
+# ============================================================
+
+loadrt threads period1=2000000
+loadrt powerlink personality=0x3f
+addf powerlink.0.update thread1
+
+setp powerlink.0.cycle-ns 2000000
+setp powerlink.0.mn-nodeid 240
+
+# setp powerlink.0.axis0-node-id 1
+# setp powerlink.0.axis1-node-id 2
+# setp powerlink.0.axis2-node-id 3
+# setp powerlink.0.axis3-node-id 4
+# setp powerlink.0.axis4-node-id 5
+
+# Пример связей:
+# net axis0-online powerlink.0.axis0-online
+# net axis0-status powerlink.0.axis0-status
+
+start

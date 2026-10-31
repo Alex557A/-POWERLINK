@@ -1,0 +1,23 @@
+# ============================================================
+# test_mn.hal - Этап 1 ТЗ: MN-мастер без осей (personality=0)
+# проект Powerlink (НИОКР Vanad)
+# ------------------------------------------------------------
+# ТЗ 1.1: loadrt powerlink personality=0, setp cycle-ns,
+#         setp mn-nodeid, addf powerlink.0.update servo-thread
+# ТЗ 1.2: mn-up=1 в течение <=10 с, pl-errors=0
+# ------------------------------------------------------------
+# Запуск (smoke):       halrun -f test_mn.hal
+# Запуск (живой тест):  halrun -I -f test_mn.hal
+#   затем в другом терминале: halcmd show pin powerlink.0
+# Перед запуском должен работать демон openPOWERLINK (plk)
+# или его эмулятор: tools/plk_sim
+# ============================================================
+
+loadrt threads period1=2000000
+loadrt powerlink personality=0
+addf powerlink.0.update thread1
+
+setp powerlink.0.cycle-ns 2000000
+setp powerlink.0.mn-nodeid 240
+
+start

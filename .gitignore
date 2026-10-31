@@ -1,0 +1,33 @@
+# Project Powerlink (NIOKR Vanad)
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.o
+*.so
+*.pyc
+__pycache__/
+tools/plk_sim
+tools/shm_proto_test
+*.tar.gz
+*.zip
+*.gz
+.env
+.local/
+/tmp/
+*.log
+# Legal/third-party (needs approval)
+Техзадача.txt
+Pismo_o_peredache_prav.md
+artifacts/00000018.br
+example_BR_OEM_device.xdd
+artifacts/*.log
+.prompt.md
+# Customer / proprietary data
+artifacts/*.pcap
+configs/*.local.conf
+
+# Internal NIOKR documents (customer test-stand records)
+ЖУРНАЛ.md
+tools/plk_analyze.py

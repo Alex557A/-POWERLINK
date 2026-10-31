@@ -1,0 +1,383 @@
+component powerlink "LinuxCNC <-> POWERLINK bridge (openPOWERLINK userspace daemon, shared memory)";
+
+/*
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ * Copyright (C) 2026 Vanad Project.
+ *
+ * powerlink.comp is a derivative work of the LinuxCNC HAL framework
+ * (linked against GPL-licensed libraries: HAL, RTAPI) and is therefore
+ * licensed ONLY under GPL-2.0-or-later. A proprietary/commercial
+ * license for this component is NOT available.
+ *
+ * (powerlink.comp — производная работа от HAL-каркаса LinuxCNC,
+ * линкуется с GPL-библиотеками (HAL, RTAPI), поэтому лицензируется
+ * ТОЛЬКО под GPL-2.0-or-later. Коммерческая лицензия на этот
+ * компонент НЕ предоставляется.)
+
+/*
+ * powerlink.comp - мост LinuxCNC <-> POWERLINK (проект Powerlink, НИОКР Vanad)
+ *
+ * Компонент-мост между HAL LinuxCNC и userspace-демоном openPOWERLINK (plk).
+ * Обмен с демоном - через POSIX shared memory (см. powerlink_shm.h).
+ *
+ * ЗАПУСК:
+ *   loadrt powerlink personality=0x3f
+ *   addf powerlink.0.update servo-thread
+ *   setp powerlink.0.cycle-ns 2000000
+ *   setp powerlink.0.mn-nodeid 240
+ *
+ * PERSONALITY (битовая маска):
+ *   0x00 - только master-пины (MN без осей)
+ *   0x01 - + ось 0
+ *   0x02 - + ось 1
+ *   0x04 - + ось 2
+ *   0x08 - + ось 3
+ *   0x10 - + ось 4
+ *   0x3F - все пять осей
+ * При personality=0 пины axisN-* НЕ создаются.
+ *
+ * Соответствие ось->узел задаётся параметрами axisN.node-id
+ * (значения назначаются в HAL-конфигурации, см. примеры в configs/)
+ * и может быть изменено без пересборки.
+ *
+ * PDO-РАСКЛАДКА (соответствует профилю привода CiA402; точные размеры
+ * PReq/PRes и резервные области — параметры интеграции конкретного
+ * привода, задаются в соответствии с его XDD-описанием):
+ *   PReq (MN->CN, 54 Б):
+ *     [0..1]   cmd-word      - слово управления, LE, u16
+ *     [2..5]   setpoint-pos  - задание позиции, LE, s32 (тики)
+ *     [6..7]   torque-limit  - ограничение момента, LE, s16
+ *     [8..53]  зарезервировано
+ *   PRes (CN->MN, 84 Б):
+ *     [0..1]   status-word   - слово состояния, LE, u16
+ *     [2..5]   actual-pos    - фактическая позиция, LE, s32 (тики)
+ *     [6..9]   actual-vel    - фактическая скорость, LE, s32
+ *     [10..13] actual-torque - фактический момент, LE, s32
+ *     [14..83] зарезервировано
+ *
+ * ПРИОРИТЕТ ЗАПИСИ preq: буфер инициализируется из raw-окна axisN.preq-##
+ * (все 54 байта), затем байты 0..7 перезаписываются структурированными
+ * пинами (cmd-word / setpoint-pos / torque-limit).
+ *
+ * Без запущенного демона компонент загружается штатно: shm-error=1,
+ * все выходные пины в нуле (это требование п.0.2 ТЗ - loadrt не падает).
+ */
+
+description """
+Мост между LinuxCNC (HAL) и шиной POWERLINK (EtherType 0x88AB, цикл 2 мс)
+через userspace-демон openPOWERLINK (plk). Обмен - POSIX shared memory
+(/powerlink, см. powerlink_shm.h).
+
+.B personality
+Битовая маска создаваемых осей: 0x01=axis0, 0x02=axis1, 0x04=axis2,
+0x08=axis3, 0x10=axis4. При personality=0 создаются только master-пины.
+
+.B PDO-раскладка (профиль CiA402; размеры - параметры интеграции)
+PReq (MN->CN, 54 Б): [0..1] cmd-word, [2..5] setpoint-pos, [6..7] torque-limit.
+PRes (CN->MN, 84 Б): [0..1] status-word, [2..5] actual-pos, [6..9] actual-vel, [10..13] actual-torque.
+""";
+
+include "powerlink_shm.h";
+
+option extra_setup yes;
+option extra_cleanup yes;
+
+/* ------------------------------------------------------------------ */
+/* master-пины (создаются всегда)                                      */
+/* ------------------------------------------------------------------ */
+pin out bit  mn-up           "1 = MN синхронизирован, циклический обмен идёт (из демона)";
+pin out u32  pl-errors       "Счётчик ошибок шины POWERLINK (растёт при сбоях)";
+pin out u32  pl-retries      "Счётчик ретраев PRes";
+pin out u32  cycle-count     "Номер цикла POWERLINK (из демона)";
+pin out u32  daemon-heartbeat "Heartbeat демона: инкремент каждый цикл";
+pin out bit  daemon-ok       "1 = демон жив (daemon-heartbeat растёт)";
+pin out bit  shm-error       "1 = shared memory недоступна (демон не запущен / несовпадение версии)";
+pin out u32  pl-state        "NMT-состояние стека openPOWERLINK";
+pin out bit  heartbeat       "Инвертируется каждый вызов update (для осциллографа)";
+param rw u32 cycle-ns        "Период цикла POWERLINK, нс (запрос демону)";
+param rw u32 mn-nodeid       "Node-id MN, по умолчанию 240";
+
+/* ------------------------------------------------------------------ */
+/* ось 0                                                              */
+/* ------------------------------------------------------------------ */
+pin out bit  axis0-online        if personality & 0x01;
+pin out bit  axis0-fault         if personality & 0x01;
+pin out u32  axis0-status        if personality & 0x01;
+pin out s32  axis0-actual-pos    if personality & 0x01;
+pin out s32  axis0-actual-vel    if personality & 0x01;
+pin out s32  axis0-actual-torque if personality & 0x01;
+pin in  u32  axis0-cmd-word      if personality & 0x01;
+pin in  s32  axis0-setpoint-pos  if personality & 0x01;
+pin in  s32  axis0-torque-limit  if personality & 0x01;
+param rw u32 axis0-node-id       if personality & 0x01;
+pin in  u32  axis0-preq-##[54]   if personality & 0x01;
+pin out u32  axis0-pres-##[84]   if personality & 0x01;
+
+/* ------------------------------------------------------------------ */
+/* ось 1                                                              */
+/* ------------------------------------------------------------------ */
+pin out bit  axis1-online        if personality & 0x02;
+pin out bit  axis1-fault         if personality & 0x02;
+pin out u32  axis1-status        if personality & 0x02;
+pin out s32  axis1-actual-pos    if personality & 0x02;
+pin out s32  axis1-actual-vel    if personality & 0x02;
+pin out s32  axis1-actual-torque if personality & 0x02;
+pin in  u32  axis1-cmd-word      if personality & 0x02;
+pin in  s32  axis1-setpoint-pos  if personality & 0x02;
+pin in  s32  axis1-torque-limit  if personality & 0x02;
+param rw u32 axis1-node-id       if personality & 0x02;
+pin in  u32  axis1-preq-##[54]   if personality & 0x02;
+pin out u32  axis1-pres-##[84]   if personality & 0x02;
+
+/* ------------------------------------------------------------------ */
+/* ось 2                                                              */
+/* ------------------------------------------------------------------ */
+pin out bit  axis2-online        if personality & 0x04;
+pin out bit  axis2-fault         if personality & 0x04;
+pin out u32  axis2-status        if personality & 0x04;
+pin out s32  axis2-actual-pos    if personality & 0x04;
+pin out s32  axis2-actual-vel    if personality & 0x04;
+pin out s32  axis2-actual-torque if personality & 0x04;
+pin in  u32  axis2-cmd-word      if personality & 0x04;
+pin in  s32  axis2-setpoint-pos  if personality & 0x04;
+pin in  s32  axis2-torque-limit  if personality & 0x04;
+param rw u32 axis2-node-id       if personality & 0x04;
+pin in  u32  axis2-preq-##[54]   if personality & 0x04;
+pin out u32  axis2-pres-##[84]   if personality & 0x04;
+
+/* ------------------------------------------------------------------ */
+/* ось 3                                                              */
+/* ------------------------------------------------------------------ */
+pin out bit  axis3-online        if personality & 0x08;
+pin out bit  axis3-fault         if personality & 0x08;
+pin out u32  axis3-status        if personality & 0x08;
+pin out s32  axis3-actual-pos    if personality & 0x08;
+pin out s32  axis3-actual-vel    if personality & 0x08;
+pin out s32  axis3-actual-torque if personality & 0x08;
+pin in  u32  axis3-cmd-word      if personality & 0x08;
+pin in  s32  axis3-setpoint-pos  if personality & 0x08;
+pin in  s32  axis3-torque-limit  if personality & 0x08;
+param rw u32 axis3-node-id       if personality & 0x08;
+pin in  u32  axis3-preq-##[54]   if personality & 0x08;
+pin out u32  axis3-pres-##[84]   if personality & 0x08;
+
+/* ------------------------------------------------------------------ */
+/* ось 4                                                              */
+/* ------------------------------------------------------------------ */
+pin out bit  axis4-online        if personality & 0x10;
+pin out bit  axis4-fault         if personality & 0x10;
+pin out u32  axis4-status        if personality & 0x10;
+pin out s32  axis4-actual-pos    if personality & 0x10;
+pin out s32  axis4-actual-vel    if personality & 0x10;
+pin out s32  axis4-actual-torque if personality & 0x10;
+pin in  u32  axis4-cmd-word      if personality & 0x10;
+pin in  s32  axis4-setpoint-pos  if personality & 0x10;
+pin in  s32  axis4-torque-limit  if personality & 0x10;
+param rw u32 axis4-node-id       if personality & 0x10;
+pin in  u32  axis4-preq-##[54]   if personality & 0x10;
+pin out u32  axis4-pres-##[84]   if personality & 0x10;
+
+/* per-instance данные */
+variable hal_u32_t last_hb;   /* последнее значение daemon_heartbeat */
+variable hal_u32_t hb_stall;  /* сколько вызовов подряд heartbeat не растёт */
+variable pl_shm_t *shm; /* mmap разделяемой памяти, 0 если недоступна */
+
+function _ nofp "Обновить состояние моста: чтение PRes/статусов из shm, запись PReq из пинов";
+
+license "GPL";
+author "Vanad NIOKR (Powerlink)";
+
+;;
+/* ==================== реализация ==================== */
+
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+
+/* модульные карты shm для EXTRA_CLEANUP (EXTRA_CLEANUP не имеет доступа к инстансам) */
+static pl_shm_t *g_shm_map[8];
+static unsigned g_shm_count;
+
+/* --- утилиты little-endian --- */
+static inline uint16_t rd_u16(const uint8_t *p) {
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+static inline uint32_t rd_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static inline int32_t rd_s32(const uint8_t *p) { return (int32_t)rd_u32(p); }
+static inline void wr_u16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xff); p[1] = (uint8_t)((v >> 8) & 0xff);
+}
+static inline void wr_s16(uint8_t *p, int16_t v) { wr_u16(p, (uint16_t)v); }
+static inline void wr_u32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xff);       p[1] = (uint8_t)((v >> 8) & 0xff);
+    p[2] = (uint8_t)((v >> 16) & 0xff); p[3] = (uint8_t)((v >> 24) & 0xff);
+}
+static inline void wr_s32(uint8_t *p, int32_t v) { wr_u32(p, (uint32_t)v); }
+
+/* поиск слота узла в shm по node-id */
+static pl_node_shm_t *pl_find_node(pl_shm_t *s, uint32_t node_id) {
+    int i;
+    if (!s) return 0;
+    for (i = 0; i < PL_MAX_NODES; i++)
+        if (s->node[i].node_id == node_id)
+            return &s->node[i];
+    return 0;
+}
+
+/*
+ * Обновление одной оси: читает PRes/статус узла из shm в выходные пины,
+ * собирает PReq из входных пинов в shm.
+ * Макрос (не функция): пины доступны только через макросы __comp_inst,
+ * поэтому код должен исполняться в контексте FUNCTION(_).
+ * ax - номер оси, nid - выражение параметра axisN-node-id.
+ */
+#define PL_AXIS_UPDATE(ax, nid) \
+    do { \
+        pl_node_shm_t *pl_n = pl_find_node(s, (nid)); \
+        int pl_i; \
+        if (!pl_n) { \
+            axis##ax##_online = 0; \
+            axis##ax##_fault = 1; \
+            axis##ax##_status = 0; \
+            axis##ax##_actual_pos = 0; \
+            axis##ax##_actual_vel = 0; \
+            axis##ax##_actual_torque = 0; \
+            for (pl_i = 0; pl_i < PL_PRES_SIZE; pl_i++) axis##ax##_pres(pl_i) = 0; \
+        } else { \
+            axis##ax##_online = (pl_n->online != 0); \
+            axis##ax##_fault  = (pl_n->fault  != 0); \
+            axis##ax##_status = pl_n->status; \
+            axis##ax##_actual_pos    = rd_s32(pl_n->pres + 2); \
+            axis##ax##_actual_vel    = rd_s32(pl_n->pres + 6); \
+            axis##ax##_actual_torque = rd_s32(pl_n->pres + 10); \
+            for (pl_i = 0; pl_i < PL_PRES_SIZE; pl_i++) axis##ax##_pres(pl_i) = pl_n->pres[pl_i]; \
+            /* сборка PReq: raw-окно (54 Б), затем структурированные поля */ \
+            for (pl_i = 0; pl_i < PL_PREQ_SIZE; pl_i++) pl_n->preq[pl_i] = (uint8_t)(axis##ax##_preq(pl_i) & 0xff); \
+            wr_u16(pl_n->preq + 0, (uint16_t)(axis##ax##_cmd_word & 0xffff)); \
+            wr_s32(pl_n->preq + 2, axis##ax##_setpoint_pos); \
+            wr_s16(pl_n->preq + 6, (int16_t)(axis##ax##_torque_limit & 0xffff)); \
+        } \
+    } while (0)
+
+
+/* --- per-instance setup: открыть и mmap разделяемую память --- */
+EXTRA_SETUP() {
+    pl_shm_t *s;
+    int fd;
+    size_t sz = sizeof(pl_shm_t);
+    volatile uint8_t *p;
+    size_t i;
+
+    shm = 0;
+    shm_error = 1;
+
+    fd = shm_open(PL_SHM_DEFAULT_NAME, O_RDWR, 0);
+    if (fd < 0) {
+        rtapi_print_msg(RTAPI_MSG_ERR,
+            "powerlink.%ld: shm_open(%s) failed: %s (демон не запущен?)\n",
+            extra_arg, PL_SHM_DEFAULT_NAME, strerror(errno));
+        return 0;
+    }
+    s = mmap(0, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (s == MAP_FAILED) {
+        rtapi_print_msg(RTAPI_MSG_ERR, "powerlink.%ld: mmap failed: %s\n",
+                        extra_arg, strerror(errno));
+        return 0;
+    }
+    if (s->magic != PL_SHM_MAGIC || s->version != PL_SHM_VERSION) {
+        rtapi_print_msg(RTAPI_MSG_ERR,
+            "powerlink.%ld: shm magic/version mismatch (0x%08x/%u), "
+            "ожидалось 0x%08x/%u - рассинхрон с демоном\n",
+            extra_arg, s->magic, s->version, PL_SHM_MAGIC, PL_SHM_VERSION);
+        munmap(s, sz);
+        return 0;
+    }
+
+    /* прогрев страниц, чтобы в RT-потоке не было page-fault */
+    for (p = (volatile uint8_t *)s, i = 0; i < sz; i += 64)
+        p[i] = p[i];
+
+    shm = s;
+    shm_error = 0;
+    if (extra_arg >= 0 && extra_arg < 8) {
+        g_shm_map[extra_arg] = s;
+        if ((unsigned)extra_arg + 1 > g_shm_count)
+            g_shm_count = (unsigned)extra_arg + 1;
+    }
+    rtapi_print_msg(RTAPI_MSG_INFO, "powerlink.%ld: shm %s connected, версия %u\n",
+                    extra_arg, PL_SHM_DEFAULT_NAME, s->version);
+    return 0;
+}
+
+/* --- per-component cleanup --- */
+EXTRA_CLEANUP() {
+    int i;
+    for (i = 0; i < 8; i++)
+        if (g_shm_map[i]) {
+            munmap(g_shm_map[i], sizeof(pl_shm_t));
+            g_shm_map[i] = 0;
+        }
+    g_shm_count = 0;
+}
+
+
+/* --- основной RT-функция --- */
+FUNCTION(_) {
+    pl_shm_t *s = (pl_shm_t *)shm;
+    uint32_t hb;
+
+    heartbeat = !heartbeat;
+
+    /* демон не запущен или shm не привязана - все выходы в ноль */
+    if (!s) {
+        mn_up = 0; pl_errors = 0; pl_retries = 0; cycle_count = 0;
+        daemon_heartbeat = 0; daemon_ok = 0; pl_state = 0; shm_error = 1;
+        if (personality & 0x01) { axis0_online = 0; axis0_fault = 1; axis0_status = 0; axis0_actual_pos = 0; axis0_actual_vel = 0; axis0_actual_torque = 0; }
+        if (personality & 0x02) { axis1_online = 0; axis1_fault = 1; axis1_status = 0; axis1_actual_pos = 0; axis1_actual_vel = 0; axis1_actual_torque = 0; }
+        if (personality & 0x04) { axis2_online = 0; axis2_fault = 1; axis2_status = 0; axis2_actual_pos = 0; axis2_actual_vel = 0; axis2_actual_torque = 0; }
+        if (personality & 0x08) { axis3_online = 0; axis3_fault = 1; axis3_status = 0; axis3_actual_pos = 0; axis3_actual_vel = 0; axis3_actual_torque = 0; }
+        if (personality & 0x10) { axis4_online = 0; axis4_fault = 1; axis4_status = 0; axis4_actual_pos = 0; axis4_actual_vel = 0; axis4_actual_torque = 0; }
+        return;
+    }
+    shm_error = 0;
+
+    mn_up         = s->plk_mn_up;
+    pl_errors     = s->plk_errors;
+    pl_retries    = s->plk_retries;
+    cycle_count   = s->plk_cycle_count;
+    daemon_heartbeat = s->plk_heartbeat;
+    pl_state      = s->plk_state;
+
+    /* watchdog демона: heartbeat должен расти */
+    hb = s->plk_heartbeat;
+    if (hb == last_hb) {
+        hb_stall++;
+    } else {
+        last_hb = hb;
+        hb_stall = 0;
+    }
+    daemon_ok = (hb_stall < 2);
+
+    /* передаём демону запрошенную конфигурацию */
+    s->plk_cfg_cycle_ns  = cycle_ns;
+    s->plk_cfg_mn_nodeid = mn_nodeid;
+
+    /* оси (только те, что созданы через personality) */
+    if (personality & 0x01)
+        PL_AXIS_UPDATE(0, axis0_node_id);
+    if (personality & 0x02)
+        PL_AXIS_UPDATE(1, axis1_node_id);
+    if (personality & 0x04)
+        PL_AXIS_UPDATE(2, axis2_node_id);
+    if (personality & 0x08)
+        PL_AXIS_UPDATE(3, axis3_node_id);
+    if (personality & 0x10)
+        PL_AXIS_UPDATE(4, axis4_node_id);
+}
